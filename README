@@ -1,0 +1,9 @@
+wordpress-configure version 0.1
+Copyright (C) 2011 Claudio Jolowicz <cj@dealloc.org>
+
+Configure a WordPress installation on Debian.
+
+wordpress-configure comes with ABSOLUTELY NO WARRANTY.  This is free software, and you
+are welcome to redistribute it under certain conditions.  See the GNU
+General Public Licence for details.
+

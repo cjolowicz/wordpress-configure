@@ -1,0 +1,736 @@
+#!/bin/bash
+#
+# wordpress-configure - Configure a WordPress installation on Debian
+#
+# Copyright (C) 2011 Claudio Jolowicz <cj@dealloc.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111 USA.
+
+program_name=$(basename $0)
+program_version=0.1
+
+set -e
+
+#
+## Defaults.
+#
+
+db_name=wordpress
+db_user=wordpress
+db_password=
+db_debian_cnf=/etc/mysql/debian.cnf
+db_table_prefix=wp_
+
+www_config_dir=/etc/apache2
+wp_program_dir=/usr/share/wordpress
+wp_config_dir=/etc/wordpress
+wp_data_dir=/var/lib/wordpress
+wp_language_dir=$wp_program_dir/wp-content/languages
+wp_language=
+
+www_sites_available=$www_config_dir/sites-available
+www_sites_enabled=$www_config_dir/sites-enabled
+
+dry_run=no
+verbose=no
+quiet=no
+print=no
+force=no
+
+create_db=no
+create_db_user=no
+create_wp_content_dir=no
+create_wp_config_file=no
+create_www_config_file=no
+remove_db=no
+remove_db_user=no
+remove_wp_content_dir=no
+remove_wp_config_file=no
+remove_www_config_file=no
+
+enable_multiple_blogs=no
+
+www_server_name=$(hostname --fqdn || true)
+
+##
+# Print version information.
+#
+version() {
+    echo "\
+$program_name version $program_version
+Copyright (C) 2011 Claudio Jolowicz <cj@dealloc.org>
+
+Configure a WordPress installation on Debian.
+
+$program_name comes with ABSOLUTELY NO WARRANTY.  This is free software, and you
+are welcome to redistribute it under certain conditions.  See the GNU
+General Public Licence for details.
+"
+}
+
+##
+# Print usage information.
+#
+usage() {
+    version
+    echo "\
+usage: $program_name [options]
+
+options:
+
+    -h, --help                      display this message
+    -V, --version                   print version number
+    -v, --verbose                   print informational messages
+    -q, --quiet                     print error messages only
+    -n, --dry-run                   print commands, do not execute them
+    -p, --print                     print settings and exit immediately
+    -f, --force                     enable dangerous operations
+        --server-name=NAME          apache server name (\`$www_server_name')
+        --db-name=NAME              database name (\`$db_name')
+        --db-user=USER              database user (\`$db_user')
+        --db-password=PASS          database password (auto-generated)
+        --db-table-prefix=PREFIX    database table prefix (\`$db_table_prefix')
+        --wp-language=LANG          WordPress localized language (\`$wp_language')
+        --create[=LIST]             create the specified items (\`all')
+        --remove[=LIST]             remove the specified items
+        --no-create[=LIST]          do not create the specified items
+        --no-remove[=LIST]          do not remove the specified items
+        --enable-multiple-blogs     configure WordPress for several blogs
+
+The default is to create everything. The \`--create' and \`--remove' options
+may be followed by a comma-separated list of any of the following keywords:
+
+    db                database
+    db-user           database user
+    wp-content-dir    WordPress content directory
+    wp-config-file    WordPress configuration file
+    www-config-file   apache configuration file
+
+Items are created in the order specified above, and removed in reverse
+order. Items are removed (if requested) before any items are created.
+
+With the \`--enable-multiple-blogs' option, WordPress is installed under a
+subdirectory using the server name. The main Debian configuration file uses
+the HTTP/1.1 request's Host header field to select the WordPress installation.
+"
+}
+
+##
+# Print an error message to stderr and exit.
+#
+error() {
+    echo "$program_name: $*" >&2
+    exit 1
+}
+
+##
+# Print a notice to stderr.
+#
+notice() {
+    if [ $quiet = no ] ; then
+        echo "$*" >&2
+    fi
+}
+
+##
+# Print an informational message to stderr.
+#
+info() {
+    if [ $verbose = yes ] ; then
+        echo "$*" >&2
+    fi
+}
+
+##
+# Usage error: invalid option
+#
+bad_option() {
+    echo "$program_name: unrecognized option \`$1'" >&2
+    echo "Try \`$program_name --help' for more information." >&2
+    exit 1
+}
+
+##
+# Usage error: missing argument
+#
+missing_argument() {
+    echo "$program_name: option \`$1' requires an argument" >&2
+    echo "Try \`$program_name --help' for more information." >&2
+    exit 1
+}
+
+##
+# Usage error: invalid argument
+#
+bad_argument () {
+    echo "$program_name: unrecognized argument \`$2' for option \`$1'" >&2
+    echo "Try \`$program_name --help' for more information." >&2
+    exit 1
+}
+
+##
+# Usage error: invalid parameter
+#
+bad_parameter () {
+    echo "$program_name: unrecognized parameter \`$1'" >&2
+    echo "Try \`$program_name --help' for more information." >&2
+    exit 1
+}
+
+##
+# Create a file.
+#
+create_file() {
+    if [ $dry_run = no ] ; then
+        cat >$1
+    else
+        echo "cat >$1 <<EOF"
+        cat
+        echo "EOF"
+    fi
+}
+
+##
+# Execute a database query.
+#
+query_db() {
+    if [ $dry_run = no ] ; then
+        mysql --defaults-extra-file=$db_debian_cnf
+    else
+        echo "mysql --defaults-extra-file=$db_debian_cnf <<EOF"
+        cat
+        echo "EOF"
+    fi
+}
+
+##
+# Check if a database exists.
+#
+query_db_exists() {
+    if [ $dry_run = yes ] ; then
+        return 0
+    fi
+
+    count=$(mysql --defaults-extra-file=$db_debian_cnf \
+                  --skip-column-names \
+                  --batch \
+                  --database=information_schema \
+                  --execute="\
+SELECT COUNT(*) FROM SCHEMATA WHERE SCHEMA_NAME = '$db_name';") || exit 1
+
+    if [ $count -eq 0 ] ; then
+        return 1
+    fi
+
+    return 0
+}
+
+##
+# Check if a database user exists.
+#
+query_db_user_exists() {
+    if [ $dry_run = yes ] ; then
+        return 0
+    fi
+
+    count=$(mysql --defaults-extra-file=$db_debian_cnf \
+                  --skip-column-names \
+                  --batch \
+                  --database=mysql \
+                  --execute="\
+SELECT COUNT(*) FROM user WHERE User = '$db_user';") || exit 1
+
+    if [ $count -eq 0 ] ; then
+        return 1
+    fi
+
+    return 0
+}
+
+##
+# Print a random string of length $1, ctype = $2.
+#
+print_random_string() {
+    dd if=/dev/urandom count=1 2>/dev/null |
+    tr -d \'\\ | # disallow single quote and backslash
+    tr -d -c "[:$2:]" |
+    cut -c "-$1"
+}
+
+##
+# Create the database.
+#
+create_db() {
+    notice "Creating database \`$db_name'..."
+    query_db <<EOF
+CREATE DATABASE \`$db_name\`;
+EOF
+}
+
+##
+# Remove the database.
+#
+remove_db() {
+    if query_db_exists ; then
+        notice "Removing database \`$db_name'..."
+        query_db <<EOF
+DROP DATABASE \`$db_name\`;
+EOF
+    fi
+}
+
+##
+# Create the database user.
+#
+create_db_user() {
+    notice "Creating database user \`$db_user'..."
+    query_db <<EOF
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER
+    ON \`$db_name\`.*
+    TO \`$db_user\`@\`localhost\`
+    IDENTIFIED BY '$db_password';
+FLUSH PRIVILEGES;
+EOF
+}
+
+##
+# Remove the database user.
+#
+remove_db_user() {
+    if query_db_user_exists ; then
+        notice "Removing database user \`$db_user'..."
+        query_db <<EOF
+DROP USER \`$db_user\`@\`localhost\`;
+FLUSH PRIVILEGES;
+EOF
+    fi
+}
+
+##
+# Create the WordPress content directory.
+#
+create_wp_content_dir() {
+    notice "Installing content directory \`$wp_content_dir'..."
+    $run install -o www-data -g www-data -m 0700 -d $wp_content_dir
+    $run install -o www-data -g www-data -m 0700 -d $wp_content_dir/blogs.dir
+    $run ln -s $wp_program_dir/wp-content/index.php $wp_content_dir/
+    $run ln -s $wp_program_dir/wp-content/languages $wp_content_dir/
+    $run ln -s $wp_program_dir/wp-content/plugins   $wp_content_dir/
+    $run ln -s $wp_program_dir/wp-content/themes    $wp_content_dir/
+}
+
+##
+# Remove the WordPress content directory.
+#
+remove_wp_content_dir() {
+    if [ -d $wp_content_dir ] ; then
+        notice "Removing content directory \`$wp_content_dir'..."
+        $run rm -rf $wp_content_dir
+    fi
+}
+
+##
+# Create the WordPress configuration file.
+#
+create_wp_config_file() {
+    if [ -f $wp_config_file ] ; then
+        error "\`$wp_config_file' already exists."
+    fi
+
+    notice "Creating configuration file \`$wp_config_file'..."
+    umask=$(umask)
+    $run umask 0027
+    create_file $wp_config_file <<EOF
+<?php
+/**
+ * The base configurations of the WordPress.
+ *
+ * This file has the following configurations: MySQL settings, Table Prefix,
+ * Secret Keys, WordPress Language, and ABSPATH. You can find more information
+ * by visiting {@link http://codex.wordpress.org/Editing_wp-config.php Editing
+ * wp-config.php} Codex page.
+ *
+ * @package WordPress
+ */
+
+/** The name of the database for WordPress */
+define('DB_NAME', '$db_name');
+
+/** MySQL database username */
+define('DB_USER', '$db_user');
+
+/** MySQL database password */
+define('DB_PASSWORD', '$db_password');
+
+/** MySQL hostname */
+define('DB_HOST', 'localhost');
+
+/** Database Charset to use in creating database tables. */
+define('DB_CHARSET', 'utf8');
+
+/** The Database Collate type. Don't change this if in doubt. */
+define('DB_COLLATE', '');
+
+/**#@+
+ * Authentication Unique Keys and Salts.
+ *
+ * Change these to different unique phrases!
+ * You can generate these using the {@link https://api.wordpress.org/secret-key/1.1/salt/ WordPress.org secret-key service}
+ * You can change these at any point in time to invalidate all existing cookies. This will force all users to have to log in again.
+ *
+ * @since 2.6.0
+ */
+define('AUTH_KEY',         '$(print_random_string 65 graph)');
+define('SECURE_AUTH_KEY',  '$(print_random_string 65 graph)');
+define('LOGGED_IN_KEY',    '$(print_random_string 65 graph)');
+define('NONCE_KEY',        '$(print_random_string 65 graph)');
+define('AUTH_SALT',        '$(print_random_string 65 graph)');
+define('SECURE_AUTH_SALT', '$(print_random_string 65 graph)');
+define('LOGGED_IN_SALT',   '$(print_random_string 65 graph)');
+define('NONCE_SALT',       '$(print_random_string 65 graph)');
+
+/**#@-*/
+
+/**
+ * WordPress Database Table prefix.
+ *
+ * You can have multiple installations in one database if you give each a unique
+ * prefix. Only numbers, letters, and underscores please!
+ */
+\$table_prefix  = '$db_table_prefix';
+
+/**
+ * WordPress Localized Language, defaults to English.
+ *
+ * Change this to localize WordPress.  A corresponding MO file for the chosen
+ * language must be installed to wp-content/languages. For example, install
+ * de.mo to wp-content/languages and set WPLANG to 'de' to enable German
+ * language support.
+ */
+define('WPLANG', '$wp_language');
+
+/**
+ * For developers: WordPress debugging mode.
+ *
+ * Change this to true to enable the display of notices during development.
+ * It is strongly recommended that plugin and theme developers use WP_DEBUG
+ * in their development environments.
+ */
+define('WP_DEBUG', false);
+
+/* That's all, stop editing! Happy blogging. */
+
+/** WordPress content directory. */
+define('WP_CONTENT_DIR', '$wp_content_dir');
+
+/** URL of the WordPress content directory. */
+define('WP_CONTENT_URL', 'http://$www_server_name/wp-content');
+
+/** Absolute path to the WordPress directory. */
+if ( !defined('ABSPATH') )
+	define('ABSPATH', '$wp_program_dir/');
+?>
+EOF
+    $run umask $umask
+    $run chgrp www-data $wp_config_file
+}
+
+##
+# Remove the WordPress configuration file.
+#
+remove_wp_config_file() {
+    if [ -f $wp_config_file ] ; then
+        notice "Removing configuration file \`$wp_config_file'..."
+        $run rm -f $wp_config_file
+    fi
+}
+
+##
+# Create the apache configuration file.
+#
+create_www_config_file() {
+    if [ -f $www_config_file ] ; then
+        error "\`$www_config_file' already exists."
+    fi
+
+    notice "Creating configuration file \`$www_config_file'..."
+    create_file $www_config_file <<EOF
+<VirtualHost *:80>
+    ServerName $www_server_name
+    ServerAdmin webmaster@$www_server_name
+
+    DocumentRoot $wp_program_dir
+    Alias /wp-content $wp_content_dir
+
+    <Directory $wp_program_dir>
+        Options FollowSymLinks
+        AllowOverride None
+        Order allow,deny
+        Allow from all
+    </Directory>
+
+    <Directory $wp_content_dir>
+        Options FollowSymLinks
+        AllowOverride None
+        Order allow,deny
+        Allow from all
+    </Directory>
+</VirtualHost>
+EOF
+
+    if [ -f $www_sites_available/$www_site_name ] ; then
+        error "\`$www_sites_available/$www_site_name' already exists."
+    fi
+
+    notice "Creating symlink to configuration file at \`$www_sites_available/$www_site_name'..."
+    $run ln -s $www_config_file $www_sites_available/$www_site_name
+}
+
+##
+# Remove the apache configuration file.
+#
+remove_www_config_file() {
+    if [ -f $www_sites_available/$www_site_name ] ; then
+        notice "Removing symlink to configuration file at \`$www_sites_available/$www_site_name'..."
+        $run rm -f $www_sites_available/$www_site_name
+    fi
+
+    if [ -f $www_config_file ] ; then
+        notice "Removing configuration file \`$www_config_file'..."
+        $run rm -f $www_config_file
+    fi
+}
+
+#
+## Parse the command line.
+#
+
+while [ $# -gt 0 ] ; do
+    option=$1
+    shift
+
+    case $option in
+        -h | --help)    usage ; exit 0 ;;
+        -V | --version) version ; exit 0 ;;
+        -v | --verbose) verbose=yes ; quiet=no ;;
+        -q | --quiet)   verbose=no  ; quiet=yes ;;
+        -p | --print)   verbose=yes ; quiet=no ; print=yes ;;
+        -n | --dry-run) dry_run=yes ;;
+        -f | --force)   force=yes ;;
+
+        --enable-multiple-blogs)
+            enable_multiple_blogs=yes
+            ;;
+
+        --server-name)
+            [ $# -gt 0 ] || missing_argument $option
+            www_server_name="$1"
+            shift
+            ;;
+
+        --db-name)
+            [ $# -gt 0 ] || missing_argument $option
+            db_name="$1"
+            shift
+            ;;
+
+        --db-user)
+            [ $# -gt 0 ] || missing_argument $option
+            db_user="$1"
+            shift
+            ;;
+
+        --db-password)
+            [ $# -gt 0 ] || missing_argument $option
+            db_password="$1"
+            shift
+            ;;
+
+        --db-table-prefix)
+            [ $# -gt 0 ] || missing_argument $option
+            db_table_prefix="$1"
+            shift
+            ;;
+
+        --wp-language)
+            [ $# -gt 0 ] || missing_argument $option
+            wp_language="$1"
+            shift
+            ;;
+
+        --create | --no-create)
+            if [ $# -gt 0 -a x${1::1} != x- ] ; then
+                argument="$1"
+                shift
+            else
+                argument=all
+            fi
+
+            [ ${option:2:2} = no ] && value=no || value=yes
+
+            case $argument in
+                db)              create_db=$value ;;
+                db-user)         create_db_user=$value ;;
+                wp-content-dir)  create_wp_content_dir=$value ;;
+                wp-config-file)  create_wp_config_file=$value ;;
+                www-config-file) create_www_config_file=$value ;;
+                all)             create_db=$value
+                                 create_db_user=$value
+                                 create_wp_content_dir=$value
+                                 create_wp_config_file=$value
+                                 create_www_config_file=$value ;;
+                *,*) set -- "$option" "${argument%%,*}" "$option" "${argument#*,}" "$@" ;;
+                *) bad_argument $option "$argument" ;;
+            esac
+            ;;
+
+        --remove | --no-remove)
+            if [ $# -gt 0 -a x${1::1} != x- ] ; then
+                argument="$1"
+                shift
+            else
+                argument=all
+            fi
+
+            [ ${option:2:2} = no ] && value=no || value=yes
+
+            case $argument in
+                db)              remove_db=$value ;;
+                db-user)         remove_db_user=$value ;;
+                wp-content-dir)  remove_wp_content_dir=$value ;;
+                wp-config-file)  remove_wp_config_file=$value ;;
+                www-config-file) remove_www_config_file=$value ;;
+                all)             remove_db=$value
+                                 remove_db_user=$value
+                                 remove_wp_content_dir=$value
+                                 remove_wp_config_file=$value
+                                 remove_www_config_file=$value ;;
+                *,*) set -- "$option" "${argument%%,*}" "$option" "${argument#*,}" "$@" ;;
+                *) bad_argument $option "$argument" ;;
+            esac
+            ;;
+
+        --)    break ;;
+        --*=*) set -- "${option%%=*}" "${option#*=}" "$@" ;;
+        --*)   bad_option $option ;;
+        -?)    bad_option $option ;;
+        -?*)   set -- "${option::2}" -"${option:2}" "$@" ;; # no arguments!
+        *)     set -- "$option" "$@" ; break ;;
+    esac
+done
+
+[ $# -eq 0 ] || bad_parameter "$1"
+
+if [ $create_db                 = no \
+     -a $create_db_user         = no \
+     -a $create_wp_content_dir  = no \
+     -a $create_wp_config_file  = no \
+     -a $create_www_config_file = no \
+     -a $remove_db              = no \
+     -a $remove_db_user         = no \
+     -a $remove_wp_content_dir  = no \
+     -a $remove_wp_config_file  = no \
+     -a $remove_www_config_file = no ] ; then
+    create_db=yes
+    create_db_user=yes
+    create_wp_content_dir=yes
+    create_wp_config_file=yes
+    create_www_config_file=yes
+fi
+
+[ -n "$www_server_name" ] || error "Server name must be set to a non-empty value."
+[ -n "$db_name"         ] || error "Database name must be set to a non-empty value."
+[ -n "$db_user"         ] || error "Database username must be set to a non-empty value."
+
+#
+## Main.
+#
+
+if [ $enable_multiple_blogs = no ] ; then
+    wp_content_dir=$wp_data_dir
+    wp_config_file=$wp_config_dir/config-default.php
+    www_config_file=$wp_config_dir/apache.conf
+    www_site_name=wordpress
+else
+    wp_content_dir=$wp_data_dir/$www_server_name
+    wp_config_file=$wp_config_dir/config-$www_server_name.php
+    www_config_file=$wp_config_dir/apache-$www_server_name.conf
+    www_site_name=wordpress-$www_server_name
+fi
+
+info "www_server_name = $www_server_name"
+info "db_name         = $db_name"
+info "db_user         = $db_user"
+info "db_password     = $db_password"
+info "db_table_prefix = $db_table_prefix"
+info "wp_content_dir  = $wp_content_dir"
+info "wp_content_dir  = $wp_content_dir"
+info "wp_config_dir   = $wp_config_dir"
+info "wp_config_file  = $wp_config_file"
+info "wp_language     = $wp_language"
+info "www_config_file = $www_config_file"
+info "www_site_name   = $www_site_name"
+
+if [ $print = yes ] ; then
+    exit 0
+fi
+
+run=
+if [ $dry_run = yes ] ; then
+    run=echo
+elif [ $(id -u) -ne 0 ] ; then
+    error "You must be root to use this script."
+elif [ $remove_db                 = yes \
+       -o $remove_db_user         = yes \
+       -o $remove_wp_content_dir  = yes \
+       -o $remove_wp_config_file  = yes \
+       -o $remove_www_config_file = yes ] ; then
+    [ $force = yes ] || \
+        error "Use \`--force' to enable removal."
+
+    ! [ -L $www_sites_enabled/$www_site_name ] || \
+        error "Please run \`a2dissite $www_site_name' first."
+fi
+
+[ -n "$db_password" ] || db_password="$(print_random_string 8 alnum)"
+
+if [ -n "$wp_language" -a ! -f $wp_language_dir/"$wp_language".mo ] ; then
+    error "Language file \`$wp_language.mo' is not installed in \`$wp_language_dir'."
+fi
+
+[ $remove_www_config_file = no ] || remove_www_config_file
+[ $remove_wp_config_file  = no ] || remove_wp_config_file
+[ $remove_wp_content_dir  = no ] || remove_wp_content_dir
+[ $remove_db_user         = no ] || remove_db_user
+[ $remove_db              = no ] || remove_db
+[ $create_db              = no ] || create_db
+[ $create_db_user         = no ] || create_db_user
+[ $create_wp_content_dir  = no ] || create_wp_content_dir
+[ $create_wp_config_file  = no ] || create_wp_config_file
+[ $create_www_config_file = no ] || create_www_config_file
+
+if [ $create_www_config_file = yes -a $dry_run = no ] ; then
+    notice "All done.
+
+Your next steps from here:
+
+    1. Edit \`$www_sites_available/$www_site_name' (optional).
+    2. Enable WordPress by running \`a2ensite $www_site_name',
+       followed by \`invoke-rc.d apache2 reload'.
+    3. Go to \`http://$www_server_name/' to continue the setup.
+"
+fi
+
+exit 0
